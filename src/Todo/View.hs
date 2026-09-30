@@ -22,8 +22,8 @@ view dispatch model = do
   Gtk.listBoxAppend entryBox entry
 
   todoList <- newBoxedList
-  forM_ (model.todos) $ \todo -> do
-    row <- new Adw.ActionRow [#title := todo.title, #useMarkup := False]
+  forM_ (visibleTasks model) $ \todo -> do
+    row <- todoRow dispatch todo
     Gtk.listBoxAppend todoList row
 
   content <-
@@ -58,11 +58,44 @@ view dispatch model = do
       ]
   Gtk.boxAppend footer count
 
-  header <- new Adw.HeaderBar []
+  filters <- filterGroup
+  Adw.toggleGroupSetActiveName filters (Just (Text.show model.filter))
+  on filters (PropertyNotify #activeName) $ \_ -> do
+    name <- Adw.toggleGroupGetActiveName filters
+    forM_ (name >>= parseFilter) $ \newFilter ->
+      dispatch (SetFilter newFilter)
+
+  header <-
+    new
+      Adw.HeaderBar
+      [ #titleWidget := filters
+      ]
   toolbar <- new Adw.ToolbarView [#content := scrolled]
   Adw.toolbarViewAddTopBar toolbar header
   Adw.toolbarViewAddBottomBar toolbar footer
   Gtk.toWidget toolbar
+
+todoRow
+  :: (Message -> IO ())
+  -> Todo
+  -> IO Adw.ActionRow
+todoRow dispatch todo = do
+  check <- new Gtk.CheckButton [#active := todo.done]
+  on check #toggled $ do
+    active <- Gtk.checkButtonGetActive check
+    dispatch (SetDoneStatus todo.id active)
+  delete <-
+    new
+      Gtk.Button
+      [ #iconName := "user-trash-symbolic"
+      , #tooltipText := "Delete"
+      , #cssClasses := ["flat"]
+      ]
+  on delete #clicked (dispatch (Delete todo.id))
+  row <- new Adw.ActionRow [#title := todo.title, #useMarkup := False]
+  Adw.actionRowAddSuffix row check
+  Adw.actionRowAddSuffix row delete
+  pure row
 
 newBoxedList :: IO Gtk.ListBox
 newBoxedList =
@@ -71,3 +104,11 @@ newBoxedList =
     [ #selectionMode := Gtk.SelectionModeNone
     , #cssClasses := ["boxed-list"]
     ]
+
+filterGroup :: IO Adw.ToggleGroup
+filterGroup = do
+  group <- new Adw.ToggleGroup []
+  forM_ [All, Active, Completed] $ \f -> do
+    toggle <- new Adw.Toggle [#name := Text.show f, #label := Text.show f]
+    Adw.toggleGroupAdd group toggle
+  pure group
