@@ -6,8 +6,8 @@ run:
     cabal run adwaita-todo
 
 style:
-    cabal-gild lexorank.cabal
-    fourmolu --mode inplace src test
+    cabal-gild adwaita-todo.cabal
+    fourmolu --mode inplace src app
 
 build:
     cabal build all

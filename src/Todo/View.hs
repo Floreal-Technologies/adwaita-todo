@@ -1,6 +1,6 @@
 module Todo.View where
 
-import Control.Monad (forM_)
+import Control.Monad (forM_, when)
 import Data.GI.Base
 import Data.Map.Strict qualified as Map
 import Data.Text qualified as Text
@@ -9,22 +9,21 @@ import GI.Gtk qualified as Gtk
 
 import Todo.Model
 
-view
-  :: (Message -> IO ())
-  -> Model
-  -> IO Gtk.Widget
-view dispatch model = do
+data Widgets = Widgets
+  { window :: Adw.ApplicationWindow
+  , filters :: Adw.ToggleGroup
+  , entry :: Adw.EntryRow
+  , todoList :: Gtk.ListBox
+  , count :: Gtk.Label
+  }
+
+build :: Adw.Application -> IO Widgets
+build app = do
   entry <- new Adw.EntryRow [#title := "New task"]
-  on entry #entryActivated $ do
-    text <- Gtk.editableGetText entry
-    dispatch (Add text)
   entryBox <- newBoxedList
   Gtk.listBoxAppend entryBox entry
 
   todoList <- newBoxedList
-  forM_ (visibleTasks model) $ \todo -> do
-    row <- todoRow dispatch todo
-    Gtk.listBoxAppend todoList row
 
   content <-
     new
@@ -46,7 +45,7 @@ view dispatch model = do
       [ #child := clamp
       ]
 
-  count <- new Gtk.Label [#label := Text.show (Map.size model.todos)]
+  count <- new Gtk.Label []
   footer <-
     new
       Gtk.Box
@@ -59,11 +58,6 @@ view dispatch model = do
   Gtk.boxAppend footer count
 
   filters <- filterGroup
-  Adw.toggleGroupSetActiveName filters (Just (Text.show model.filter))
-  on filters (PropertyNotify #activeName) $ \_ -> do
-    name <- Adw.toggleGroupGetActiveName filters
-    forM_ (name >>= parseFilter) $ \newFilter ->
-      dispatch (SetFilter newFilter)
 
   header <-
     new
@@ -73,7 +67,46 @@ view dispatch model = do
   toolbar <- new Adw.ToolbarView [#content := scrolled]
   Adw.toolbarViewAddTopBar toolbar header
   Adw.toolbarViewAddBottomBar toolbar footer
-  Gtk.toWidget toolbar
+
+  window <-
+    new
+      Adw.ApplicationWindow
+      [ #application := app
+      , #title := "Todos"
+      , #defaultWidth := 480
+      , #defaultHeight := 640
+      , #content := toolbar
+      ]
+  pure Widgets {window, filters, entry, todoList, count}
+
+connect :: (Message -> IO ()) -> Widgets -> IO ()
+connect dispatch widgets = do
+  on widgets.entry #entryActivated $ do
+    text <- Gtk.editableGetText widgets.entry
+    dispatch (Add text)
+    Gtk.editableSetText widgets.entry ""
+  on widgets.filters (PropertyNotify #activeName) $ \_ -> do
+    name <- Adw.toggleGroupGetActiveName widgets.filters
+    forM_ (name >>= parseFilter) $ \newFilter ->
+      dispatch (SetFilter newFilter)
+  pure ()
+
+render :: (Message -> IO ()) -> Widgets -> Maybe Model -> Model -> IO ()
+render dispatch widgets previous model = do
+  let changed :: (Eq a) => (Model -> a) -> (a -> IO ()) -> IO ()
+      changed field action =
+        when (fmap field previous /= Just (field model)) (action (field model))
+
+  changed (.filter) $ \newFilter ->
+    Adw.toggleGroupSetActiveName widgets.filters (Just (Text.show newFilter))
+  changed (Map.size . (.todos)) $ \size ->
+    Gtk.labelSetLabel widgets.count (Text.show size)
+
+  -- The rows are still built again on each render.
+  Gtk.listBoxRemoveAll widgets.todoList
+  forM_ (visibleTasks model) $ \todo -> do
+    row <- todoRow dispatch todo
+    Gtk.listBoxAppend widgets.todoList row
 
 todoRow
   :: (Message -> IO ())

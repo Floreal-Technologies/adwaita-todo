@@ -1,7 +1,6 @@
 module Todo.Runtime where
 
 import Control.Monad
-import Data.GI.Base (AttrOp (..), new)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import GI.Adw qualified as Adw
 import GI.GLib qualified as GLib
@@ -12,15 +11,8 @@ import Todo.View qualified as View
 
 run :: Adw.Application -> IO ()
 run app = do
-  window <-
-    new
-      Adw.ApplicationWindow
-      [ #application := app
-      , #title := "Todos"
-      , #defaultWidth := 480
-      , #defaultHeight := 640
-      ]
   ref <- newIORef Model.init
+  widgets <- View.build app
   let {- rec -}
       dispatch :: Model.Message -> IO ()
       dispatch message =
@@ -33,9 +25,8 @@ run app = do
         oldModel <- readIORef ref
         let (newModel, _effects) = Model.update message oldModel
         writeIORef ref newModel
-        content <- View.view dispatch newModel
-        Adw.applicationWindowSetContent window (Just content)
+        View.render dispatch widgets (Just oldModel) newModel
 
-  content <- View.view dispatch Model.init
-  Adw.applicationWindowSetContent window (Just content)
-  Gtk.windowPresent window
+  View.connect dispatch widgets
+  View.render dispatch widgets Nothing Model.init
+  Gtk.windowPresent widgets.window
