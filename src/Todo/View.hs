@@ -6,8 +6,12 @@ import Data.Map.Strict qualified as Map
 import Data.Text qualified as Text
 import GI.Adw qualified as Adw
 import GI.Gtk qualified as Gtk
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Map.Strict (Map)
 
 import Todo.Model
+
+data Row = Row Adw.ActionRow Gtk.CheckButton
 
 data Widgets = Widgets
   { window :: Adw.ApplicationWindow
@@ -15,6 +19,7 @@ data Widgets = Widgets
   , entry :: Adw.EntryRow
   , todoList :: Gtk.ListBox
   , count :: Gtk.Label
+  , rows :: IORef (Map TodoId Row)
   }
 
 build :: Adw.Application -> IO Widgets
@@ -77,7 +82,8 @@ build app = do
       , #defaultHeight := 640
       , #content := toolbar
       ]
-  pure Widgets {window, filters, entry, todoList, count}
+  rows <- newIORef Map.empty
+  pure Widgets {window, filters, entry, todoList, count, rows}
 
 connect :: (Message -> IO ()) -> Widgets -> IO ()
 connect dispatch widgets = do
