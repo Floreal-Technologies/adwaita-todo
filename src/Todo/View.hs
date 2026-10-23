@@ -6,35 +6,46 @@ import Control.Applicative ((<|>))
 import Control.Monad (forM_, unless, void, when)
 import Data.Foldable (for_)
 import Data.GI.Base
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Int (Int32)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Traversable (for)
 import GI.Adw qualified as Adw
 import GI.Gtk qualified as Gtk
 
 import Todo.Model
-import Data.Int
 
+-- | The widgets of one row of the todo list. A row lives as long as
+-- its todo.
 data Row = Row
-  { todo :: Todo
-  , actionRow :: Adw.ActionRow
+  { actionRow :: Adw.ActionRow
   , check :: Gtk.CheckButton
   }
 
+-- | The widgets that live as long as the window.
 data Widgets = Widgets
   { window :: Adw.ApplicationWindow
   , filters :: Adw.ToggleGroup
   , entry :: Adw.EntryRow
+  , toggleAll :: Gtk.Button
   , todoList :: Gtk.ListBox
   , count :: Gtk.Label
-  , rows :: IORef (Map TodoId Row)
   }
 
 build :: Adw.Application -> IO Widgets
 build app = do
+  -- A button, not a check button. See 'connect'.
+  toggleAll <-
+    new
+      Gtk.Button
+      [ #iconName := "object-select-symbolic"
+      , #valign := Gtk.AlignCenter
+      , #cssClasses := ["flat"]
+      ]
   entry <- new Adw.EntryRow [#title := "New task"]
+  Adw.entryRowAddPrefix entry toggleAll
   entryBox <- newBoxedList
   Gtk.listBoxAppend entryBox entry
 
@@ -92,8 +103,7 @@ build app = do
       , #defaultHeight := 640
       , #content := toolbar
       ]
-  rows <- newIORef Map.empty
-  pure Widgets {window, filters, entry, todoList, count, rows}
+  pure Widgets {window, filters, entry, toggleAll, todoList, count}
 
 connect :: (Message -> IO ()) -> Widgets -> IO ()
 connect dispatch widgets = do
@@ -101,51 +111,67 @@ connect dispatch widgets = do
     text <- Gtk.editableGetText widgets.entry
     dispatch (Add text)
     Gtk.editableSetText widgets.entry ""
-  on widgets.filters (PropertyNotify #activeName) $ \_ -> do
-    name <- Adw.toggleGroupGetActiveName widgets.filters
-    forM_ (name >>= parseFilter) $ \newFilter ->
+  on widgets.toggleAll #clicked (dispatch ToggleAll)
+  on widgets.filters (PropertyNotify #active) $ \_ -> do
+    index <- Adw.toggleGroupGetActive widgets.filters
+    for_ (lookup index (zip [0 ..] allFilters)) $ \newFilter ->
       dispatch (SetFilter newFilter)
   pure ()
 
-render :: (Message -> IO ()) -> Widgets -> Maybe Model -> Model -> IO ()
-render dispatch widgets previous model = do
+render
+  :: (Message -> IO ())
+  -> Widgets
+  -> Map TodoId Row
+  -> Maybe Model
+  -> Model
+  -> IO (Map TodoId Row)
+render dispatch widgets rows previous model = do
   let changed :: (Eq a) => (Model -> a) -> (a -> IO ()) -> IO ()
       changed field action =
         when (fmap field previous /= Just (field model)) (action (field model))
 
   changed (.filter) $ \newFilter ->
-    Adw.toggleGroupSetActiveName widgets.filters (Just (Text.show newFilter))
+    Adw.toggleGroupSetActive widgets.filters (fromIntegral (fromEnum newFilter))
 
   changed (Map.size . (.todos)) $ \size ->
     Gtk.labelSetLabel widgets.count (Text.show size)
+  changed allDone $ \done ->
+    Gtk.widgetSetTooltipText widgets.toggleAll (Just (toggleAllTooltip done))
+  changed (not . Map.null . (.todos)) (Gtk.widgetSetSensitive widgets.toggleAll)
 
-  renderRows dispatch widgets model
+  renderRows dispatch widgets rows previous model
 
 -- | Make the rows match the todos of the model.
-renderRows :: (Message -> IO ()) -> Widgets -> Model -> IO ()
-renderRows dispatch widgets model = do
-  current <- readIORef widgets.rows
+renderRows
+  :: (Message -> IO ())
+  -> Widgets
+  -> Map TodoId Row
+  -> Maybe Model
+  -> Model
+  -> IO (Map TodoId Row)
+renderRows dispatch widgets rows previous model = do
   let visible todoId = maybe False (matches model.filter) (Map.lookup todoId model.todos)
-      (staying, leaving) = Map.partitionWithKey (\todoId _ -> visible todoId) current
+      (staying, leaving) = Map.partitionWithKey (\todoId _ -> visible todoId) rows
 
   -- A row that goes away takes the focus with it. Move the focus first.
   keepFocus widgets leaving staying
 
   -- Step 1: Remove the rows of the todos that do not exist any more.
-  for_ (Map.difference current model.todos) $ \row ->
+  for_ (Map.difference rows model.todos) $ \row ->
     Gtk.listBoxRemove widgets.todoList row.actionRow
 
   -- Step 2: Create or change the rows, in the order of the todos. A new
   -- row goes to the index of its todo. The rows before it are already
-  -- in their place, so the index is correct.
+  -- in their place, so the index is correct. The filter hides rows. It
+  -- does not remove them.
   next <- for (zip [0 ..] (Map.toAscList model.todos)) $ \(index, (todoId, todo)) -> do
-    row <- case Map.lookup todoId current of
-      Nothing -> insertRow dispatch widgets index todo
-      Just row -> refreshRow todo row
-    -- Step 3: The filter hides rows. It does not remove them.
-    Gtk.widgetSetVisible row.actionRow (matches model.filter todo)
+    row <- case Map.lookup todoId rows of
+      Nothing -> insertRow dispatch widgets index model.filter todo
+      Just row -> do
+        refreshRow previous model todo row
+        pure row
     pure (todoId, row)
-  writeIORef widgets.rows (Map.fromList next)
+  pure (Map.fromList next)
 
 -- | Move the focus out of the rows that are about to be removed or
 -- hidden. When the focused widget goes away, GTK moves the focus to
@@ -170,24 +196,34 @@ keepFocus widgets leaving staying = do
         Nothing -> pure False
       unless moved $ void (Gtk.widgetGrabFocus widgets.entry)
 
-insertRow :: (Message -> IO ()) -> Widgets -> Int32 -> Todo -> IO Row
-insertRow dispatch widgets index todo = do
+insertRow :: (Message -> IO ()) -> Widgets -> Int32 -> Filter -> Todo -> IO Row
+insertRow dispatch widgets index activeFilter todo = do
   row <- todoRow dispatch todo
-  Gtk.listBoxInsert widgets.todoList row.actionRow  index
+  Gtk.widgetSetVisible row.actionRow (matches activeFilter todo)
+  Gtk.listBoxInsert widgets.todoList row.actionRow index
   pure row
 
--- | Set the properties of a row that differ between the todo it shows
--- and the new todo. A set property emits the same signal as a click.
--- The handler then sends the value that the model already has, and
--- 'update' changes nothing. To set only what changed keeps most of
--- these echoes from occurring at all.
-refreshRow :: Todo -> Row -> IO Row
-refreshRow todo row = do
-  when (row.todo.title /= todo.title) $
-    Adw.preferencesRowSetTitle row.actionRow todo.title
-  when (row.todo.done /= todo.done) $
-    Gtk.checkButtonSetActive row.check todo.done
-  pure row {todo = todo}
+-- | Set the properties of a row that differ between the previous model
+-- and the new one. This is the 'changed' of 'render', one level down:
+-- the field is a function of the model and of the todo of the row.
+--
+-- A set property emits the same signal as a click. The handler then
+-- sends the value that the model already has, and 'update' changes
+-- nothing. To set only what changed keeps most of these echoes from
+-- occurring at all.
+refreshRow :: Maybe Model -> Model -> Todo -> Row -> IO ()
+refreshRow previous model todo row = do
+  let changed :: (Eq a) => (Model -> Todo -> a) -> (a -> IO ()) -> IO ()
+      changed field action = do
+        let before = do
+              old <- previous
+              oldTodo <- Map.lookup todo.id old.todos
+              pure (field old oldTodo)
+        when (before /= Just (field model todo)) (action (field model todo))
+
+  changed (\_ t -> t.title) (Adw.preferencesRowSetTitle row.actionRow)
+  changed (\_ t -> t.done) (Gtk.checkButtonSetActive row.check)
+  changed (\m t -> matches m.filter t) (Gtk.widgetSetVisible row.actionRow)
 
 todoRow
   :: (Message -> IO ())
@@ -212,7 +248,7 @@ todoRow dispatch todo = do
   actionRow <- new Adw.ActionRow [#title := todo.title, #useMarkup := False]
   Adw.actionRowAddSuffix actionRow check
   Adw.actionRowAddSuffix actionRow delete
-  pure Row {todo, actionRow, check}
+  pure Row {actionRow, check}
 
 newBoxedList :: IO Gtk.ListBox
 newBoxedList =
@@ -222,10 +258,14 @@ newBoxedList =
     , #cssClasses := ["boxed-list"]
     ]
 
+toggleAllTooltip :: Bool -> Text
+toggleAllTooltip True = "Mark all as not done"
+toggleAllTooltip False = "Mark all as done"
+
 filterGroup :: IO Adw.ToggleGroup
 filterGroup = do
   group <- new Adw.ToggleGroup []
-  forM_ [All, Active, Completed] $ \f -> do
-    toggle <- new Adw.Toggle [#name := Text.show f, #label := Text.show f]
+  forM_ allFilters $ \f -> do
+    toggle <- new Adw.Toggle [#label := Text.show f]
     Adw.toggleGroupAdd group toggle
   pure group

@@ -2,6 +2,7 @@ module Todo.Runtime where
 
 import Control.Monad
 import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.Map.Strict qualified as Map
 import GI.Adw qualified as Adw
 import GI.GLib qualified as GLib
 import GI.Gtk qualified as Gtk
@@ -11,8 +12,11 @@ import Todo.View qualified as View
 
 run :: Adw.Application -> IO ()
 run app = do
-  ref <- newIORef Model.init
   widgets <- View.build app
+  -- The runtime owns all the state: the model, and the rows that
+  -- show its todos.
+  modelRef <- newIORef Model.init
+  rowsRef <- newIORef Map.empty
   let {- rec -}
       dispatch :: Model.Message -> IO ()
       dispatch message =
@@ -22,11 +26,14 @@ run app = do
 
       step :: Model.Message -> IO ()
       step message = do
-        oldModel <- readIORef ref
-        let (newModel, _effects) = Model.update message oldModel
-        writeIORef ref newModel
-        View.render dispatch widgets (Just oldModel) newModel
+        oldModel <- readIORef modelRef
+        oldRows <- readIORef rowsRef
+        let newModel = Model.update message oldModel
+        newRows <- View.render dispatch widgets oldRows (Just oldModel) newModel
+        writeIORef modelRef newModel
+        writeIORef rowsRef newRows
 
   View.connect dispatch widgets
-  View.render dispatch widgets Nothing Model.init
+  rows <- View.render dispatch widgets Map.empty Nothing Model.init
+  writeIORef rowsRef rows
   Gtk.windowPresent widgets.window
